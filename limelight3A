@@ -1,0 +1,232 @@
+
+import com.qualcomm.hardware.limelightvision.LLResult;
+import com.qualcomm.hardware.limelightvision.LLResultTypes;
+import com.qualcomm.hardware.limelightvision.Limelight3A;
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
+import com.qualcomm.robotcore.hardware.CRServo;
+import com.qualcomm.robotcore.hardware.DcMotor;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.PIDFCoefficients;
+import com.qualcomm.robotcore.util.ElapsedTime;
+
+import java.util.List;
+
+@TeleOp(name = "Mecanum Aim Assist (Limelight)", group = "Vision")
+public class AutoAlignAprilTagTeleopLimelight extends LinearOpMode {
+
+    // ---------------- Drive Motors ----------------
+    private DcMotor leftFront, leftBack, rightFront, rightBack;
+
+
+
+    // ---------------- Limelight ----------------
+    private Limelight3A limelight;
+
+    boolean aimAssistTracker = false;
+
+    private ElapsedTime feederTimer = new ElapsedTime();
+
+    // ---------------- Aim Assist Tuning ----------------
+    private static final double KP_TURN_FROM_TX     = 0.020;
+    private static final double MAX_ASSIST_TURN     = 0.20;
+    private static final double DRIVER_TURN_DEADZONE = 0.25;
+    private static final double TX_TOLERANCE_DEG    = 1.0;
+
+
+    private static final double ASSIST_MAX_RANGE_IN = 999; // range limit change if needed
+
+    private double desiredTxDeg = 0;
+
+    private boolean prevDpadLeft, prevDpadRight, prevA;
+
+
+    private int currentAprilTagID = -1;
+
+    private final int blueGoal = 20;
+    private final int redGoal  = 24;
+
+    boolean toggleA = false;
+    boolean lastA = false;
+
+    // ---------------- Launcher State Machine ----------------
+
+    // ---------------- Limelight Geometry ----------------
+
+    // you can use full 3d instead but this geometry formular work good enough
+    private double limelightMountAngleDegrees = 14;
+    private double limelightLensHeightInches  = 14.375;
+    private double goalHeightInches           = 29;
+    private double aprilTagDistanceInches;
+
+    @Override
+    public void runOpMode() {
+
+        initHardware();
+
+
+
+        // -------- Limelight Init --------
+        limelight = hardwareMap.get(Limelight3A.class, "limelight");
+        limelight.setPollRateHz(30);
+        limelight.pipelineSwitch(0);
+        limelight.start();
+
+        telemetry.addLine("Ready (Limelight Aim Assist)");
+        telemetry.update();
+        // lime = new Limelight(limelight, follower);
+
+
+
+
+        waitForStart();
+
+        while (opModeIsActive()) {
+
+            handleOffsetButtons();
+
+
+            // -------- Driver Input --------
+            double drive      = -gamepad1.left_stick_y;
+            double strafe     =  gamepad1.left_stick_x;
+            double driverTurn =  gamepad1.right_stick_x;
+
+            // -------- Aim Assist --------
+            double assistTurn = driveAssist(driverTurn);
+            double turn = clip(driverTurn + assistTurn, -1.0, 1.0);
+
+
+
+            mecanumDrive(drive, strafe, turn);
+
+            boolean currentA = gamepad1.a;
+
+            // Rising edge detection
+            if (currentA && !lastA) {
+                toggleA = !toggleA;
+            }
+
+            lastA = currentA;
+
+            // Example usage
+            aimAssistTracker = toggleA; //toggle aim assist
+
+
+
+
+            telemetry.addData("aimAssit", aimAssistTracker);
+
+            telemetry.addData("Tag ID", currentAprilTagID);
+            telemetry.addData("desiredTx", desiredTxDeg);
+
+            telemetry.update();
+        }
+
+        limelight.stop();
+    }
+
+    // =====================================================
+    // Aim Assist using Limelight
+    // =====================================================
+    private double driveAssist(double driverTurn) {
+        double assistTurn = 0.0;
+
+        LLResult result = limelight.getLatestResult();
+        if(aimAssistTracker) {
+            if (result != null && result.isValid()) {
+
+                aprilTagDistanceInches = estimateDistanceInches(result);
+                currentAprilTagID = getBestTagId(result);
+
+                boolean correctTag = (currentAprilTagID == blueGoal || currentAprilTagID == redGoal);
+                boolean inRange = aprilTagDistanceInches <= ASSIST_MAX_RANGE_IN;
+                boolean driverTurning = Math.abs(driverTurn) > DRIVER_TURN_DEADZONE;
+
+                double tx = result.getTx();
+                double txError = tx - desiredTxDeg;
+
+                if (correctTag && inRange && !driverTurning && Math.abs(txError) > TX_TOLERANCE_DEG) {
+                    assistTurn = clip(txError * KP_TURN_FROM_TX,
+                            -MAX_ASSIST_TURN,
+                            MAX_ASSIST_TURN);
+                }
+            }
+        }
+        return assistTurn;  // if robot is turing the away from the apriltag add a negative sign
+    }
+
+    private double estimateDistanceInches(LLResult result) {
+        double ty = result.getTy();
+        double angleRad = Math.toRadians(limelightMountAngleDegrees + ty);
+        return Math.abs((goalHeightInches - limelightLensHeightInches) / Math.tan(angleRad));
+    }
+
+    private int getBestTagId(LLResult result) {
+        try {
+            List<LLResultTypes.FiducialResult> tags = result.getFiducialResults();
+            if (tags != null && !tags.isEmpty()) {
+                return tags.get(0).getFiducialId();
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    // =====================================================
+    // Offset tuning
+    // =====================================================
+    private void handleOffsetButtons() {
+        if (gamepad1.dpad_right && !prevDpadRight) desiredTxDeg += 1;
+        if (gamepad1.dpad_left  && !prevDpadLeft) desiredTxDeg -= 1;
+        if (gamepad1.a && !prevA) desiredTxDeg = 0.0;
+
+        prevDpadRight = gamepad1.dpad_right;
+        prevDpadLeft  = gamepad1.dpad_left;
+        prevA         = gamepad1.a;
+    }
+
+    // =====================================================
+    // Hardware + Helpers
+    // =====================================================
+    private void initHardware() {
+        leftFront  = hardwareMap.get(DcMotor.class, "left_front_drive");
+        leftBack   = hardwareMap.get(DcMotor.class, "left_back_drive");
+        rightFront = hardwareMap.get(DcMotor.class, "right_front_drive");
+        rightBack  = hardwareMap.get(DcMotor.class, "right_back_drive");
+
+
+
+        leftFront.setDirection(DcMotor.Direction.REVERSE);
+        leftBack.setDirection(DcMotor.Direction.REVERSE);
+
+
+        leftFront.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        leftBack.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        rightFront.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        rightBack.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+
+        );
+    }
+
+
+    private void mecanumDrive(double drive, double strafe, double turn) {
+        double lf = drive + strafe + turn;
+        double lb = drive - strafe + turn;
+        double rf = drive - strafe - turn;
+        double rb = drive + strafe - turn;
+
+        double max = Math.max(1.0,
+                Math.max(Math.abs(lf),
+                        Math.max(Math.abs(lb),
+                                Math.max(Math.abs(rf), Math.abs(rb)))));
+
+        leftFront.setPower(lf / max);
+        leftBack.setPower(lb / max);
+        rightFront.setPower(rf / max);
+        rightBack.setPower(rb / max);
+    }
+
+    private double clip(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
+    }
+
+}
