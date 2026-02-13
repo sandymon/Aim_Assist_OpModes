@@ -1,0 +1,289 @@
+package org.firstinspires.ftc.teamcode.vision;
+
+import com.qualcomm.robotcore.eventloop.opmode.LinearOpMode;
+import com.qualcomm.robotcore.hardware.PIDFCoefficients;
+import com.qualcomm.robotcore.hardware.DcMotorEx;
+import com.qualcomm.robotcore.hardware.CRServo;
+import com.qualcomm.robotcore.util.ElapsedTime;
+import com.qualcomm.robotcore.eventloop.opmode.TeleOp;
+import com.qualcomm.robotcore.hardware.DcMotor;
+
+import org.firstinspires.ftc.robotcore.external.hardware.camera.WebcamName;
+import org.firstinspires.ftc.vision.VisionPortal;
+import org.firstinspires.ftc.vision.apriltag.AprilTagDetection;
+import org.firstinspires.ftc.vision.apriltag.AprilTagProcessor;
+
+import android.util.Size;
+
+import java.util.List;
+
+@TeleOp(name = "Mecanum Aim Assist", group = "Vision")
+public class AutoAlignAprilTagTeleop extends LinearOpMode {
+
+    // Drive motors
+    private DcMotor leftFront, leftBack, rightFront, rightBack;
+
+
+
+  
+
+    ElapsedTime feederTimer = new ElapsedTime();
+
+    // Vision
+    private VisionPortal visionPortal;
+    private AprilTagProcessor aprilTag;
+
+    // Aim assist tuning
+    private static final double KP_ASSIST_FROM_X      = 0.03;
+    private static final double MAX_ASSIST_TURN       = 0.18;
+    private static final double DRIVER_TURN_DEADZONE  = 0.25;
+    private static final double X_TOLERANCE_IN        = 1.0;
+    private static final double ASSIST_MAX_RANGE_IN   = 40.0; // inches
+
+    // Where we want the tag to appear in camera (in)
+    private double desiredXIn = 0.0;
+
+
+    // Optional: toggle assist with X
+    private boolean prevX         = false;
+    private boolean assistEnabled = true;
+
+    private int blueGoal = 20;
+    private int redGoal  = 24;
+
+    private LaunchState launchState;
+
+    @Override
+    public void runOpMode() throws InterruptedException {
+
+        initHardware();
+        initVision();
+
+        telemetry.addLine("Ready.");
+        telemetry.addLine("Drive normally with sticks.");
+        telemetry.addLine("Aim assist: auto-turn when tag is visible AND <= 40\".");
+        telemetry.addLine("Dpad Left/Right = adjust desired X (in), A = reset.");
+        telemetry.addLine("X = toggle assist ON/OFF.");
+        telemetry.update();
+
+        waitForStart();
+
+        while (opModeIsActive()) {
+
+            handleOffsetButtons(); // desiredXIn + assistEnabled
+
+            // -------- Driver input --------
+            double drive      = -gamepad1.left_stick_y;
+            double strafe     =  gamepad1.left_stick_x;
+            // NOTE: if turn direction feels wrong, flip this sign:
+            double driverTurn = -gamepad1.right_stick_x;
+
+            // -------- Vision assist --------
+            double assistTurn = 0.0;
+            boolean assistActive = false;
+
+            AprilTagDetection tag = getTargetTag();
+
+            if (assistEnabled && tag != null && tag.ftcPose != null) {
+                double range = tag.ftcPose.range; // inches
+
+                // Only consider assist if we are within max range
+                if (range <= ASSIST_MAX_RANGE_IN &&
+                        (tag.id == blueGoal || tag.id == redGoal)) {
+
+                    double x = tag.ftcPose.x;       // left/right offset
+                    double xError = x - desiredXIn; // error from desired position
+
+                    boolean driverIsTurning =
+                            Math.abs(driverTurn) > DRIVER_TURN_DEADZONE;
+
+                    // Only help if:
+                    // - tag is off enough horizontally
+                    // - driver isn't already turning
+                    if (Math.abs(xError) > X_TOLERANCE_IN && !driverIsTurning) {
+                        // If it turns away instead of toward, flip sign here:
+                        assistTurn = -xError * KP_ASSIST_FROM_X;
+                        assistTurn = clip(assistTurn,
+                                          -MAX_ASSIST_TURN,
+                                           MAX_ASSIST_TURN);
+                        assistActive = true;
+                    }
+
+                    telemetry.addData("Tag Seen", tag.id);
+                    telemetry.addData("Range (in)", range);
+                    telemetry.addData("Tag X (in)", x);
+                    telemetry.addData("Desired X (in)", desiredXIn);
+                    telemetry.addData("X Error (in)", xError);
+                    telemetry.addData("AssistTurn", assistTurn);
+                    telemetry.addData("AssistActive", assistActive);
+                    telemetry.addData("Assist Max Range", ASSIST_MAX_RANGE_IN);
+                } else {
+                    telemetry.addData("Tag Seen (out of range or wrong ID)", tag.id);
+                    telemetry.addData("Range (in)", range);
+                }
+            } else {
+                telemetry.addData("Tag Seen", "None or assist disabled");
+            }
+
+            // -------- Combine driver + assist --------
+            double turn = driverTurn + assistTurn;
+            turn = clip(turn, -1.0, 1.0);
+
+            mecanumDrive(drive, strafe, turn);
+
+         
+
+            telemetry.addData("State", launchState);
+            telemetry.addData("motorSpeed", launcher.getVelocity());
+            telemetry.addData("Drive", drive);
+            telemetry.addData("Strafe", strafe);
+            telemetry.addData("DriverTurn", driverTurn);
+            telemetry.addData("FinalTurn", turn);
+            telemetry.addData("Desired X (in)", desiredXIn);
+            telemetry.addData("Assist Enabled", assistEnabled);
+            telemetry.update();
+        }
+
+        if (visionPortal != null) visionPortal.close();
+    }
+
+    // Adjust desiredXIn live with dpad + A, and toggle assist with X
+    private void handleOffsetButtons() {
+        boolean dpadRightNow = gamepad1.dpad_right;
+        boolean dpadLeftNow  = gamepad1.dpad_left;
+        boolean aNow         = gamepad1.a;
+        boolean xNow         = gamepad1.x;
+
+        if (dpadRightNow && !prevDpadRight) {
+            desiredXIn += 0.5;  // bump right
+        }
+        if (dpadLeftNow && !prevDpadLeft) {
+            desiredXIn -= 0.5;  // bump left
+        }
+        if (aNow && !prevA) {
+            desiredXIn = 0.0;   // reset
+        }
+        if (xNow && !prevX) {
+            assistEnabled = !assistEnabled;
+        }
+
+        prevDpadRight = dpadRightNow;
+        prevDpadLeft  = dpadLeftNow;
+        prevA         = aNow;
+        prevX         = xNow;
+    }
+
+    private void initHardware() {
+        leftFront  = hardwareMap.get(DcMotor.class, "left_front_drive");
+        leftBack   = hardwareMap.get(DcMotor.class, "left_back_drive");
+        rightFront = hardwareMap.get(DcMotor.class, "right_front_drive");
+        rightBack  = hardwareMap.get(DcMotor.class, "right_back_drive");
+
+        intake   = hardwareMap.get(DcMotor.class, "intake");
+        launcher = hardwareMap.get(DcMotorEx.class, "launcher");
+
+        leftFeeder  = hardwareMap.get(CRServo.class, "left_feeder");
+        rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
+
+        launcher.setDirection(DcMotor.Direction.REVERSE);
+        launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        launcher.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER,
+                new PIDFCoefficients(300, 0, 0, 10));
+
+        leftFeeder.setPower(STOP_SPEED);
+        rightFeeder.setPower(STOP_SPEED);
+
+        // Adjust directions for your mecanum
+        leftFront.setDirection(DcMotor.Direction.REVERSE);
+        leftFront.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        leftBack.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        rightFront.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+        rightBack.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
+
+        launchState = LaunchState.IDLE;
+    }
+
+    private void initVision() {
+        aprilTag = new AprilTagProcessor.Builder().build();
+        WebcamName webcam = hardwareMap.get(WebcamName.class, "Webcam 1");
+
+        VisionPortal.Builder builder = new VisionPortal.Builder()
+                .setCamera(webcam)
+                .addProcessor(aprilTag)
+                .enableLiveView(true)
+                .setAutoStopLiveView(false);
+
+        try { builder.setCameraResolution(new Size(640, 480)); } catch (Exception ignored) {}
+
+        visionPortal = builder.build();
+    }
+
+    private AprilTagDetection getTargetTag() {
+        List<AprilTagDetection> list = aprilTag.getDetections();
+        if (list == null || list.isEmpty()) return null;
+
+        AprilTagDetection best = list.get(0);
+        for (AprilTagDetection d : list) {
+            if (best.ftcPose != null && d.ftcPose != null &&
+                d.ftcPose.range < best.ftcPose.range) {
+                best = d;
+            }
+        }
+        return best;
+    }
+
+    private void mecanumDrive(double drive, double strafe, double turn) {
+        double lf = drive + strafe + turn;
+        double lb = drive - strafe + turn;
+        double rf = drive - strafe - turn;
+        double rb = drive + strafe - turn;
+
+        double max = Math.max(
+                1.0,
+                Math.max(Math.abs(lf),
+                        Math.max(Math.abs(lb),
+                                Math.max(Math.abs(rf), Math.abs(rb)))));
+
+        leftFront.setPower(lf / max);
+        leftBack.setPower(lb / max);
+        rightFront.setPower(rf / max);
+        rightBack.setPower(rb / max);
+    }
+
+    void launch(boolean shotRequested) {
+        switch (launchState) {
+            case IDLE:
+                if (shotRequested) {
+                    launchState = LaunchState.SPIN_UP;
+                }
+                break;
+            case SPIN_UP:
+                launcher.setVelocity(LAUNCHER_TARGET_VELOCITY);
+                if (launcher.getVelocity() > LAUNCHER_MIN_VELOCITY) {
+                    launchState = LaunchState.LAUNCH;
+                }
+                break;
+            case LAUNCH:
+                leftFeeder.setPower(-FULL_SPEED);
+                rightFeeder.setPower(FULL_SPEED);
+                feederTimer.reset();
+                launchState = LaunchState.LAUNCHING;
+                break;
+            case LAUNCHING:
+                if (feederTimer.seconds() > FEED_TIME_SECONDS) {
+                    launchState = LaunchState.IDLE;
+                    leftFeeder.setPower(STOP_SPEED);
+                    rightFeeder.setPower(STOP_SPEED);
+                }
+                break;
+        }
+    }
+
+    private double clip(double v, double min, double max) {
+        return Math.max(min, Math.min(max, v));
+    }
+}
+
+
+i ahve this code that is using a logitec webcame i now want to use a limelight instead but i want to keep using onbotjava
